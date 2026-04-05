@@ -1,8 +1,10 @@
 import os
 import json
+import re
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
+from datetime import datetime, date
+from telegram import Update
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -21,94 +23,138 @@ claude   = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ─────────────────────────────────────────────
-# HELPERS
+# MEMÓRIA DE CONVERSA (em memória, por sessão)
 # ─────────────────────────────────────────────
+conversation_history: dict[int, list] = {}
+MAX_HISTORY = 10  # últimas N mensagens
 
-def get_raio_x() -> str:
-    try:
-        rows = supabase.table('raio_x').select('chave, valor').execute().data
-        return json.dumps({r['chave']: r['valor'] for r in rows}, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"Erro ao buscar Raio-X: {e}")
-        return "{}"
+
+def get_history(chat_id: int) -> list:
+    return conversation_history.get(chat_id, [])
+
+
+def add_to_history(chat_id: int, role: str, content: str):
+    if chat_id not in conversation_history:
+        conversation_history[chat_id] = []
+    conversation_history[chat_id].append({"role": role, "content": content})
+    conversation_history[chat_id] = conversation_history[chat_id][-MAX_HISTORY:]
+
 
 def is_allowed(update: Update) -> bool:
     return not ALLOWED_CHAT_ID or update.effective_chat.id == ALLOWED_CHAT_ID
 
+
 # ─────────────────────────────────────────────
-# INTENT DETECTION + CLASSIFICATION
+# CONTEXTO COMPLETO (Raio-X + Tasks reais do banco)
 # ─────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Você é o assistente pessoal do Victor Silva, especialista em CRM de iGaming.
+def get_full_context() -> str:
+    try:
+        raio_x_rows = supabase.table('raio_x').select('chave, valor').execute().data
+        raio_x = {r['chave']: r['valor'] for r in raio_x_rows}
 
-CONTEXTO ATUAL DO VICTOR (Raio-X):
-{raio_x}
+        tasks = (supabase.table('items')
+                 .select('id, texto, empresa, categoria, prioridade, tipo, tags, prazo, status')
+                 .eq('status', 'pendente')
+                 .order('prioridade')
+                 .limit(40)
+                 .execute().data)
 
-Analise a mensagem e retorne APENAS um JSON válido (sem markdown, sem texto extra).
+        return json.dumps({
+            "raio_x": raio_x,
+            "tasks_pendentes": tasks,
+            "hoje": date.today().isoformat()
+        }, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Erro ao buscar contexto: {e}")
+        return "{}"
 
-PRIMEIRO determine a "intencao":
-- "novo_item"     → Victor quer registrar task, ideia, insight, reunião, etc.
-- "concluir"      → Victor diz que terminou/fez/concluiu algo ("concluí X", "feito X", "terminei X", "done X")
-- "cancelar"      → Victor quer cancelar/remover/excluir algo
-- "atualizar_raiox" → Victor atualiza seu contexto ("agora estou", "parei com X", "mudei de X")
-- "consulta"      → Victor pergunta algo ("o que tenho", "quanto falta", "quais são")
 
-Para "novo_item" retorne:
+# ─────────────────────────────────────────────
+# PROMPT DO ASSISTENTE
+# ─────────────────────────────────────────────
+
+SYSTEM_PROMPT = """Você é a secretária pessoal e inteligente do Victor Silva, especialista em CRM de iGaming.
+
+Você tem acesso completo ao contexto dele:
+- Raio-X: quem ele é, o que faz em cada empresa, prioridades
+- Tasks pendentes reais do banco de dados
+- Histórico da conversa atual
+
+CONTEXTO ATUAL:
+{context}
+
+─────────────────────────────────────────────
+COMO VOCÊ FUNCIONA:
+
+1. Você lê o histórico + a nova mensagem e ENTENDE o que Victor quer
+2. Você responde de forma natural, como uma secretária próxima e inteligente
+3. Se precisar executar uma ação (salvar, concluir, cancelar, atualizar), inclua no JSON
+
+SEMPRE retorne um JSON válido (sem markdown, sem texto extra):
 {{
-  "intencao": "novo_item",
-  "tipo": "task|idea|insight|question|priority|meeting|financial|health|personal",
-  "texto": "versão limpa e estruturada",
-  "categoria": "crm|growth|produto|lideranca|saude|financeiro|pessoal|projeto",
-  "empresa": "betvip|ng|pwp|pessoal|todos",
-  "prioridade": 1,
-  "tags": ["tag"],
-  "pessoas": [],
-  "prazo": "YYYY-MM-DD ou null",
-  "resumo_confirmacao": "frase curta confirmando o que foi salvo"
+  "resposta": "sua resposta em texto natural, sem markdown, sem asteriscos",
+  "acao": null,
+  "dados": {{}}
 }}
 
-Para "concluir" retorne:
-{{
-  "intencao": "concluir",
-  "busca": "texto-chave do item a marcar como feito (palavras principais)",
-  "resumo_confirmacao": "frase confirmando conclusão"
-}}
+Valores possíveis para "acao":
 
-Para "cancelar" retorne:
-{{
-  "intencao": "cancelar",
-  "busca": "texto-chave do item a cancelar",
-  "resumo_confirmacao": "frase confirmando cancelamento"
-}}
+→ "salvar_item": quando Victor registrar algo novo
+  "dados": {{
+    "tipo": "task|idea|insight|question|priority|meeting|financial|health|personal",
+    "texto": "texto limpo do item",
+    "empresa": "betvip|ng|pwp|pessoal|todos",
+    "categoria": "crm|growth|produto|lideranca|saude|financeiro|pessoal|projeto",
+    "prioridade": 1,
+    "tags": ["tag"],
+    "prazo": "YYYY-MM-DD ou null"
+  }}
 
-Para "atualizar_raiox" retorne:
-{{
-  "intencao": "atualizar_raiox",
-  "chave": "chave existente no raio-x a atualizar (ex: pwp_contexto, prioridades_agora)",
-  "novo_valor": "novo valor completo para essa chave",
-  "resumo_confirmacao": "frase confirmando atualização"
-}}
+→ "concluir_busca": marcar item específico como concluído por texto
+  "dados": {{"busca": "palavras-chave do item"}}
 
-Para "consulta" retorne:
-{{
-  "intencao": "consulta",
-  "resposta": "resposta direta baseada no contexto do Raio-X"
-}}
+→ "cancelar_busca": cancelar item específico por texto
+  "dados": {{"busca": "palavras-chave do item"}}
 
-Regras:
-- prioridade 1 = crítico (faz hoje), 5 = algum dia
-- empresa: BetVIP→betvip, NG→ng, PWP→pwp
-- tags: lowercase com hífen, máximo 4
-- tom: assistente próximo, direto"""
+→ "bulk_concluir": concluir todos de uma empresa ou categoria
+  "dados": {{"filtro_empresa": "pwp|ng|betvip|pessoal|null", "filtro_categoria": "crm|saude|...|null"}}
+
+→ "bulk_cancelar": cancelar todos de uma empresa ou categoria
+  "dados": {{"filtro_empresa": "pwp|ng|betvip|pessoal|null", "filtro_categoria": "crm|saude|...|null"}}
+
+→ "atualizar_raiox": atualizar chave do Raio-X
+  "dados": {{"chave": "nome_da_chave", "valor": "novo valor completo"}}
+
+─────────────────────────────────────────────
+REGRAS DE COMPORTAMENTO:
+
+- Use o HISTÓRICO para entender respostas curtas ("1", "sim", "todas", "isso")
+- Use as TASKS REAIS do banco para responder perguntas sobre o que está pendente
+- Se perguntarem sobre uma empresa/projeto que não existe no contexto, diga que não está cadastrado e pergunte se quer adicionar
+- Quando Victor disser que concluiu algo, execute a ação E confirme
+- Quando Victor perguntar sobre prioridades, use os dados reais de tasks_pendentes
+- Tom: direto, próximo, sem enrolação. Máximo 4 linhas na resposta quando possível
+- Sem markdown na resposta (sem **, sem #, sem -)
+- Emojis com moderação, só quando fizer sentido"""
 
 
-async def analyze(text: str, raio_x: str) -> dict:
+# ─────────────────────────────────────────────
+# CHAMADA AO CLAUDE (com histórico)
+# ─────────────────────────────────────────────
+
+async def think(user_text: str, chat_id: int) -> dict:
+    context  = get_full_context()
+    history  = get_history(chat_id)
+    messages = history + [{"role": "user", "content": user_text}]
+
     response = claude.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=800,
-        system=SYSTEM_PROMPT.format(raio_x=raio_x),
-        messages=[{"role": "user", "content": text}]
+        max_tokens=1000,
+        system=SYSTEM_PROMPT.format(context=context),
+        messages=messages
     )
+
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
@@ -116,43 +162,39 @@ async def analyze(text: str, raio_x: str) -> dict:
             raw = raw[4:]
     return json.loads(raw.strip())
 
+
 # ─────────────────────────────────────────────
-# SUPABASE ACTIONS
+# EXECUÇÃO DE AÇÕES
 # ─────────────────────────────────────────────
 
-def save_item(c: dict, original: str, msg_id: int) -> str | None:
+def do_salvar_item(dados: dict, original: str, msg_id: int):
     row = {
-        "tipo":         c.get("tipo", "idea"),
-        "texto":        c.get("texto", original),
-        "categoria":    c.get("categoria", "pessoal"),
-        "empresa":      c.get("empresa", "pessoal"),
-        "prioridade":   c.get("prioridade", 3),
+        "tipo":         dados.get("tipo", "idea"),
+        "texto":        dados.get("texto", original),
+        "empresa":      dados.get("empresa", "pessoal"),
+        "categoria":    dados.get("categoria", "pessoal"),
+        "prioridade":   dados.get("prioridade", 3),
         "status":       "pendente",
-        "tags":         c.get("tags", []),
-        "pessoas":      c.get("pessoas", []),
-        "prazo":        c.get("prazo"),
+        "tags":         dados.get("tags", []),
+        "prazo":        dados.get("prazo"),
         "fonte":        "telegram",
         "msg_original": original,
     }
-    res = supabase.table('items').insert(row).execute()
+    supabase.table('items').insert(row).execute()
     supabase.table('log_mensagens').insert({
         "telegram_msg_id":     msg_id,
         "conteudo_raw":        original,
-        "conteudo_processado": json.dumps(c, ensure_ascii=False),
+        "conteudo_processado": json.dumps(dados, ensure_ascii=False),
         "items_gerados":       1,
     }).execute()
-    return res.data[0]['id'] if res.data else None
 
 
-def find_and_update_status(busca: str, novo_status: str) -> list:
-    """Busca itens por texto e atualiza status. Retorna itens encontrados."""
+def do_busca_update(busca: str, novo_status: str) -> int:
     words = [w for w in busca.lower().split() if len(w) > 3]
     if not words:
-        return []
-
-    # busca os 50 mais recentes pendentes e filtra por similaridade
+        return 0
     rows = (supabase.table('items')
-            .select('id, texto, empresa')
+            .select('id, texto')
             .eq('status', 'pendente')
             .order('criado_em', desc=True)
             .limit(100)
@@ -160,25 +202,39 @@ def find_and_update_status(busca: str, novo_status: str) -> list:
 
     matches = []
     for row in rows:
-        texto_lower = (row.get('texto') or '').lower()
-        score = sum(1 for w in words if w in texto_lower)
+        txt = (row.get('texto') or '').lower()
+        score = sum(1 for w in words if w in txt)
         if score >= max(1, len(words) // 2):
-            matches.append((score, row))
+            matches.append((score, row['id']))
 
     matches.sort(key=lambda x: -x[0])
-    updated = []
-    for _, row in matches[:3]:  # atualiza até 3 matches
-        from datetime import datetime
-        patch = {"status": novo_status}
-        if novo_status == "concluido":
-            patch["concluido_em"] = datetime.utcnow().isoformat()
-        supabase.table('items').update(patch).eq('id', row['id']).execute()
-        updated.append(row)
+    count = 0
+    patch = {"status": novo_status}
+    if novo_status == "concluido":
+        patch["concluido_em"] = datetime.utcnow().isoformat()
 
-    return updated
+    for _, item_id in matches[:5]:
+        supabase.table('items').update(patch).eq('id', item_id).execute()
+        count += 1
+    return count
 
 
-def update_raio_x(chave: str, valor: str) -> bool:
+def do_bulk_update(novo_status: str, filtro_empresa: str | None, filtro_categoria: str | None) -> int:
+    patch = {"status": novo_status}
+    if novo_status == "concluido":
+        patch["concluido_em"] = datetime.utcnow().isoformat()
+
+    query = supabase.table('items').update(patch).eq('status', 'pendente')
+    if filtro_empresa and filtro_empresa != "null":
+        query = query.eq('empresa', filtro_empresa)
+    if filtro_categoria and filtro_categoria != "null":
+        query = query.eq('categoria', filtro_categoria)
+
+    res = query.execute()
+    return len(res.data) if res.data else 0
+
+
+def do_atualizar_raiox(chave: str, valor: str) -> bool:
     try:
         supabase.table('raio_x').upsert(
             {"chave": chave, "valor": valor},
@@ -186,102 +242,68 @@ def update_raio_x(chave: str, valor: str) -> bool:
         ).execute()
         return True
     except Exception as e:
-        logger.error(f"Erro ao atualizar Raio-X: {e}")
+        logger.error(f"Erro raio-x: {e}")
         return False
 
-# ─────────────────────────────────────────────
-# LABELS
-# ─────────────────────────────────────────────
-
-TIPO_EMOJI    = {"task":"✅","idea":"💡","insight":"🧠","question":"❓",
-                 "priority":"🚨","meeting":"📅","financial":"💰","health":"💪","personal":"👤"}
-EMPRESA_LABEL = {"betvip":"BetVIP","ng":"NG","pwp":"PWP","pessoal":"Pessoal","todos":"Geral"}
-PRIO_STARS    = {1:"🔴🔴🔴",2:"🔴🔴",3:"🟡",4:"🟢",5:"⚪"}
 
 # ─────────────────────────────────────────────
-# MAIN MESSAGE HANDLER
+# HANDLER PRINCIPAL
 # ─────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
 
-    text   = update.message.text
-    msg_id = update.message.message_id
+    text    = update.message.text
+    msg_id  = update.message.message_id
+    chat_id = update.effective_chat.id
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        raio_x  = get_raio_x()
-        result  = await analyze(text, raio_x)
-        intencao = result.get("intencao", "novo_item")
+        result   = await think(text, chat_id)
+        resposta = result.get("resposta", "...")
+        acao     = result.get("acao")
+        dados    = result.get("dados", {})
 
-        # ── NOVO ITEM ──────────────────────────────
-        if intencao == "novo_item":
-            save_item(result, text, msg_id)
-            emoji   = TIPO_EMOJI.get(result.get("tipo","idea"), "📝")
-            empresa = EMPRESA_LABEL.get(result.get("empresa","pessoal"), "Geral")
-            prio    = PRIO_STARS.get(result.get("prioridade", 3), "🟡")
-            confirm = result.get("resumo_confirmacao", "Salvo!")
-            reply   = f"{emoji} <b>Salvo!</b>\n\n{confirm}\n\n<code>{empresa}</code> {prio}"
-            if result.get("prazo"):
-                reply += f"\n📅 Prazo: <code>{result['prazo']}</code>"
-            if result.get("tags"):
-                reply += "\n" + " ".join(f"#{t}" for t in result["tags"][:3])
-            await update.message.reply_text(reply, parse_mode="HTML")
+        # executa ação se houver
+        extra = ""
+        if acao == "salvar_item":
+            do_salvar_item(dados, text, msg_id)
+            extra = " ✅"
 
-        # ── CONCLUIR ───────────────────────────────
-        elif intencao == "concluir":
-            busca   = result.get("busca", text)
-            updated = find_and_update_status(busca, "concluido")
-            confirm = result.get("resumo_confirmacao", "Marcado como feito!")
-            if updated:
-                items_txt = "\n".join(f"  ✅ {r['texto'][:60]}" for r in updated)
-                reply = f"✅ <b>Concluído!</b>\n\n{confirm}\n\n{items_txt}"
-            else:
-                reply = f"🔍 Não encontrei nenhum item pendente com esse texto. Tenta descrever diferente ou usa /pendentes pra ver a lista."
-            await update.message.reply_text(reply, parse_mode="HTML")
+        elif acao == "concluir_busca":
+            count = do_busca_update(dados.get("busca", text), "concluido")
+            extra = f" ({count} item{'s' if count != 1 else ''} concluído{'s' if count != 1 else ''})"
 
-        # ── CANCELAR ───────────────────────────────
-        elif intencao == "cancelar":
-            busca   = result.get("busca", text)
-            updated = find_and_update_status(busca, "cancelado")
-            confirm = result.get("resumo_confirmacao", "Cancelado.")
-            if updated:
-                items_txt = "\n".join(f"  ❌ {r['texto'][:60]}" for r in updated)
-                reply = f"❌ <b>Cancelado!</b>\n\n{confirm}\n\n{items_txt}"
-            else:
-                reply = "🔍 Não encontrei item com esse texto. Usa /pendentes pra ver o que está aberto."
-            await update.message.reply_text(reply, parse_mode="HTML")
+        elif acao == "cancelar_busca":
+            count = do_busca_update(dados.get("busca", text), "cancelado")
+            extra = f" ({count} item{'s' if count != 1 else ''} cancelado{'s' if count != 1 else ''})"
 
-        # ── ATUALIZAR RAIO-X ───────────────────────
-        elif intencao == "atualizar_raiox":
-            chave  = result.get("chave", "estado_atual")
-            valor  = result.get("novo_valor", text)
-            ok     = update_raio_x(chave, valor)
-            confirm = result.get("resumo_confirmacao", "Raio-X atualizado.")
-            if ok:
-                reply = f"🔄 <b>Raio-X atualizado!</b>\n\n{confirm}\n\n<code>{chave}</code> → salvo."
-            else:
-                reply = "⚠️ Erro ao atualizar o Raio-X. Tenta de novo."
-            await update.message.reply_text(reply, parse_mode="HTML")
+        elif acao == "bulk_concluir":
+            count = do_bulk_update("concluido", dados.get("filtro_empresa"), dados.get("filtro_categoria"))
+            extra = f" ({count} itens concluídos)"
 
-        # ── CONSULTA ───────────────────────────────
-        elif intencao == "consulta":
-            resposta = result.get("resposta", "Não sei responder isso ainda.")
-            await update.message.reply_text(f"🧠 {resposta}", parse_mode="HTML")
+        elif acao == "bulk_cancelar":
+            count = do_bulk_update("cancelado", dados.get("filtro_empresa"), dados.get("filtro_categoria"))
+            extra = f" ({count} itens cancelados)"
 
-        else:
-            # fallback → salva como item
-            save_item(result, text, msg_id)
-            await update.message.reply_text("📝 <b>Salvo!</b>", parse_mode="HTML")
+        elif acao == "atualizar_raiox":
+            do_atualizar_raiox(dados.get("chave", ""), dados.get("valor", ""))
+
+        # adiciona ao histórico
+        add_to_history(chat_id, "user",      text)
+        add_to_history(chat_id, "assistant", resposta + extra)
+
+        await update.message.reply_text(resposta + extra)
 
     except json.JSONDecodeError as e:
         logger.error(f"JSON inválido: {e}")
-        await update.message.reply_text("⚠️ Erro ao classificar. Tenta reformular?")
+        await update.message.reply_text("Tive um problema interno. Tenta de novo?")
     except Exception as e:
-        logger.error(f"Erro geral: {e}", exc_info=True)
-        await update.message.reply_text("⚠️ Algo deu errado. Já anoto e sigo.")
+        logger.error(f"Erro: {e}", exc_info=True)
+        await update.message.reply_text("Algo deu errado. Já olho isso.")
+
 
 # ─────────────────────────────────────────────
 # COMMANDS
@@ -292,17 +314,14 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        f"🧠 <b>Victor Brain online.</b>\n\n"
-        f"Joga qualquer coisa aqui — task, ideia, insight, prioridade.\n"
-        f"Eu classifico, organizo e salvo automaticamente.\n\n"
-        f"<b>Comandos:</b>\n"
-        f"/pendentes — prioridades P1 e P2 🔥\n"
-        f"/hoje — tasks com prazo hoje\n"
-        f"/raio_x — teu contexto atual\n"
-        f"/concluir [texto] — marca item como feito\n\n"
-        f"Seu chat ID: <code>{chat_id}</code>\n"
-        f"Coloca esse ID no Railway como <code>ALLOWED_CHAT_ID</code>",
-        parse_mode="HTML"
+        f"🧠 Victor Brain online.\n\n"
+        f"Fala comigo como fala com uma pessoa. Registro tasks, ideias, insights, "
+        f"marco coisas como feitas, busco o que está pendente — tudo por conversa natural.\n\n"
+        f"Comandos rápidos:\n"
+        f"/pendentes — prioridades P1 e P2\n"
+        f"/hoje — o que vence hoje\n"
+        f"/limpar — limpa histórico da conversa\n\n"
+        f"Seu chat ID: {chat_id}"
     )
 
 
@@ -319,28 +338,27 @@ async def handle_pendentes(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 .execute().data)
 
         if not rows:
-            await update.message.reply_text("✅ Nada crítico ou urgente no momento!")
+            await update.message.reply_text("Nada crítico ou urgente no momento. ✅")
             return
 
-        lines = ["🚨 <b>Prioridades altas:</b>\n"]
+        EMPRESA = {"betvip":"BetVIP","ng":"NG","pwp":"PWP","pessoal":"Pessoal","todos":"Geral"}
+        lines = ["Prioridades P1 e P2:\n"]
         for r in rows:
-            emp   = EMPRESA_LABEL.get(r.get('empresa','pessoal'), '?')
-            txt   = r.get('texto','')[:65]
-            p     = r.get('prioridade', 3)
-            emoji = TIPO_EMOJI.get(r.get('tipo','task'), '📝')
-            lines.append(f"P{p} {emoji} <code>[{emp}]</code> {txt}")
+            emp = EMPRESA.get(r.get('empresa','pessoal'), '?')
+            txt = r.get('texto','')[:70]
+            p   = r.get('prioridade', 2)
+            lines.append(f"P{p} [{emp}] {txt}")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        await update.message.reply_text("\n".join(lines))
     except Exception as e:
-        logger.error(f"Erro em /pendentes: {e}")
-        await update.message.reply_text("⚠️ Erro ao buscar pendentes.")
+        logger.error(f"Erro /pendentes: {e}")
+        await update.message.reply_text("Erro ao buscar. Tenta de novo.")
 
 
 async def handle_hoje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     try:
-        from datetime import date
         hoje = date.today().isoformat()
         rows = (supabase.table('items')
                 .select('tipo, texto, empresa, prioridade')
@@ -351,61 +369,28 @@ async def handle_hoje(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 .execute().data)
 
         if not rows:
-            await update.message.reply_text("🎯 Nada específico pra hoje. Foca nas prioridades!")
+            await update.message.reply_text("Nada com vencimento hoje.")
             return
 
-        lines = [f"📅 <b>Para hoje ({hoje}):</b>\n"]
+        EMPRESA = {"betvip":"BetVIP","ng":"NG","pwp":"PWP","pessoal":"Pessoal","todos":"Geral"}
+        lines = [f"Para hoje ({hoje}):\n"]
         for r in rows:
-            emp   = EMPRESA_LABEL.get(r.get('empresa','pessoal'),'?')
-            txt   = r.get('texto','')[:65]
-            emoji = TIPO_EMOJI.get(r.get('tipo','task'),'📝')
-            lines.append(f"{emoji} <code>[{emp}]</code> {txt}")
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            emp = EMPRESA.get(r.get('empresa','pessoal'),'?')
+            txt = r.get('texto','')[:70]
+            lines.append(f"[{emp}] {txt}")
+        await update.message.reply_text("\n".join(lines))
     except Exception as e:
-        logger.error(f"Erro em /hoje: {e}")
-        await update.message.reply_text("⚠️ Erro ao buscar tasks de hoje.")
+        logger.error(f"Erro /hoje: {e}")
+        await update.message.reply_text("Erro ao buscar. Tenta de novo.")
 
 
-async def handle_concluir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_limpar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
-    busca = " ".join(context.args) if context.args else ""
-    if not busca:
-        await update.message.reply_text(
-            "Usa assim: <code>/concluir [parte do texto do item]</code>\n"
-            "Exemplo: <code>/concluir programação de abril</code>",
-            parse_mode="HTML"
-        )
-        return
-    updated = find_and_update_status(busca, "concluido")
-    if updated:
-        items_txt = "\n".join(f"  ✅ {r['texto'][:70]}" for r in updated)
-        await update.message.reply_text(f"✅ <b>Marcado como feito!</b>\n\n{items_txt}", parse_mode="HTML")
-    else:
-        await update.message.reply_text(
-            f"🔍 Não encontrei item pendente com <i>{busca}</i>.\nUsa /pendentes pra ver a lista.",
-            parse_mode="HTML"
-        )
+    chat_id = update.effective_chat.id
+    conversation_history.pop(chat_id, None)
+    await update.message.reply_text("Histórico da conversa limpo. Novo começo! 🧹")
 
-
-async def handle_raio_x(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-    try:
-        rows = supabase.table('raio_x').select('chave, valor').execute().data
-        if not rows:
-            await update.message.reply_text("Raio-X vazio.")
-            return
-        chaves_resumo = ['identidade','prioridades_agora','estado_atual','projeto_brain']
-        lines = ["🔍 <b>Raio-X atual:</b>\n"]
-        for r in rows:
-            if r['chave'] in chaves_resumo:
-                val = r['valor'][:200] + ("..." if len(r['valor']) > 200 else "")
-                lines.append(f"<b>{r['chave']}</b>\n{val}\n")
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Erro em /raio_x: {e}")
-        await update.message.reply_text("⚠️ Erro ao buscar Raio-X.")
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -416,11 +401,11 @@ def main():
     app.add_handler(CommandHandler("start",     handle_start))
     app.add_handler(CommandHandler("pendentes", handle_pendentes))
     app.add_handler(CommandHandler("hoje",      handle_hoje))
-    app.add_handler(CommandHandler("concluir",  handle_concluir))
-    app.add_handler(CommandHandler("raio_x",    handle_raio_x))
+    app.add_handler(CommandHandler("limpar",    handle_limpar))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("🧠 Victor Brain iniciado.")
+    logger.info("🧠 Victor Brain — modo assistente iniciado.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
