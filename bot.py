@@ -20,7 +20,7 @@ ANTHROPIC_KEY   = os.environ['ANTHROPIC_API_KEY']
 SUPABASE_URL    = os.environ['SUPABASE_URL']
 SUPABASE_KEY    = os.environ['SUPABASE_KEY']
 ALLOWED_CHAT_ID = int(os.environ.get('ALLOWED_CHAT_ID', '0'))
-CLAUDE_MODEL    = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-5-20250514')
+CLAUDE_MODEL    = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-5')
 
 claude   = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
