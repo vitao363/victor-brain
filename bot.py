@@ -148,16 +148,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stars   = "⭐" * (6 - p)
         confirm = classified.get("resumo_confirmacao", "Salvo!")
 
-        reply = f"{emoji} *Salvo!*\n\n{confirm}\n\n`{empresa}` {stars}"
+        reply = f"{emoji} <b>Salvo!</b>\n\n{confirm}\n\n<code>{empresa}</code> {stars}"
 
         if classified.get("prazo"):
-            reply += f"\n📅 Prazo: `{classified['prazo']}`"
+            reply += f"\n📅 Prazo: <code>{classified['prazo']}</code>"
 
         if classified.get("tags"):
             tags_str = " ".join([f"#{t}" for t in classified["tags"][:3]])
             reply += f"\n{tags_str}"
 
-        await update.message.reply_text(reply, parse_mode="Markdown")
+        await update.message.reply_text(reply, parse_mode="HTML")
 
     except json.JSONDecodeError as e:
         logger.error(f"JSON inválido do Claude: {e}")
@@ -172,15 +172,16 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        f"🧠 *Victor Brain online.*\n\n"
+        f"🧠 <b>Victor Brain online.</b>\n\n"
         f"Joga qualquer coisa aqui — task, ideia, insight, prioridade.\n"
         f"Eu classifico, organizo e salvo automaticamente.\n\n"
-        f"Comandos:\n"
+        f"<b>Comandos:</b>\n"
         f"/pendentes — lista suas prioridades 🔥\n"
         f"/hoje — o que fazer hoje\n"
-        f"/raio\_x — resumo do seu contexto atual\n\n"
-        f"Seu chat ID: `{chat_id}` _(coloca isso no .env como ALLOWED\_CHAT\_ID)_",
-        parse_mode="Markdown"
+        f"/raio_x — resumo do seu contexto atual\n\n"
+        f"Seu chat ID: <code>{chat_id}</code>\n"
+        f"Coloca esse ID no Railway como <code>ALLOWED_CHAT_ID</code>",
+        parse_mode="HTML"
     )
 
 
@@ -200,15 +201,15 @@ async def handle_pendentes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ Nada crítico ou urgente no momento!")
             return
 
-        lines = ["🚨 *Prioridades altas:*\n"]
+        lines = ["🚨 <b>Prioridades altas:</b>\n"]
         for r in rows:
             emp   = EMPRESA_LABEL.get(r.get('empresa', 'pessoal'), '?')
             txt   = r.get('texto', '')[:70]
             p     = r.get('prioridade', 3)
             emoji = TIPO_EMOJI.get(r.get('tipo', 'task'), '📝')
-            lines.append(f"P{p} {emoji} `[{emp}]` {txt}")
+            lines.append(f"P{p} {emoji} <code>[{emp}]</code> {txt}")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"Erro em /pendentes: {e}")
@@ -234,14 +235,14 @@ async def handle_hoje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🎯 Nada específico pra hoje. Foca nas prioridades gerais!")
             return
 
-        lines = [f"📅 *Para hoje ({hoje}):*\n"]
+        lines = [f"📅 <b>Para hoje ({hoje}):</b>\n"]
         for r in rows:
             emp   = EMPRESA_LABEL.get(r.get('empresa', 'pessoal'), '?')
             txt   = r.get('texto', '')[:70]
             emoji = TIPO_EMOJI.get(r.get('tipo', 'task'), '📝')
-            lines.append(f"{emoji} `[{emp}]` {txt}")
+            lines.append(f"{emoji} <code>[{emp}]</code> {txt}")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"Erro em /hoje: {e}")
@@ -259,13 +260,13 @@ async def handle_raio_x(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # mostrar só chaves principais
         chaves_resumo = ['identidade', 'prioridades_agora', 'estado_atual']
-        lines = ["🔍 *Raio-X atual:*\n"]
+        lines = ["🔍 <b>Raio-X atual:</b>\n"]
         for r in rows:
             if r['chave'] in chaves_resumo:
                 val = r['valor'][:200] + ("..." if len(r['valor']) > 200 else "")
-                lines.append(f"*{r['chave']}*\n{val}\n")
+                lines.append(f"<b>{r['chave']}</b>\n{val}\n")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"Erro em /raio_x: {e}")
