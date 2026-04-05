@@ -1,6 +1,5 @@
 import os
 import json
-import re
 import logging
 from datetime import datetime, date
 from telegram import Update
@@ -13,20 +12,24 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────
+# ENV
+# ─────────────────────────────────────────────
 TELEGRAM_TOKEN  = os.environ['TELEGRAM_TOKEN']
 ANTHROPIC_KEY   = os.environ['ANTHROPIC_API_KEY']
 SUPABASE_URL    = os.environ['SUPABASE_URL']
 SUPABASE_KEY    = os.environ['SUPABASE_KEY']
 ALLOWED_CHAT_ID = int(os.environ.get('ALLOWED_CHAT_ID', '0'))
+CLAUDE_MODEL    = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-5-20250514')
 
 claude   = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ─────────────────────────────────────────────
-# MEMÓRIA DE CONVERSA (em memória, por sessão)
+# MEMÓRIA DE CONVERSA
 # ─────────────────────────────────────────────
 conversation_history: dict[int, list] = {}
-MAX_HISTORY = 10  # últimas N mensagens
+MAX_HISTORY = 20  # mais contexto = respostas mais inteligentes
 
 
 def get_history(chat_id: int) -> list:
@@ -45,209 +48,469 @@ def is_allowed(update: Update) -> bool:
 
 
 # ─────────────────────────────────────────────
-# CONTEXTO COMPLETO (Raio-X + Tasks reais do banco)
+# RAIO-X (carregado no system prompt)
 # ─────────────────────────────────────────────
 
-def get_full_context() -> str:
+def get_raio_x() -> str:
     try:
-        raio_x_rows = supabase.table('raio_x').select('chave, valor').execute().data
-        raio_x = {r['chave']: r['valor'] for r in raio_x_rows}
-
-        tasks = (supabase.table('items')
-                 .select('id, texto, empresa, categoria, prioridade, tipo, tags, prazo, status')
-                 .eq('status', 'pendente')
-                 .order('prioridade')
-                 .limit(40)
-                 .execute().data)
-
-        return json.dumps({
-            "raio_x": raio_x,
-            "tasks_pendentes": tasks,
-            "hoje": date.today().isoformat()
-        }, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"Erro ao buscar contexto: {e}")
-        return "{}"
-
-
-# ─────────────────────────────────────────────
-# PROMPT DO ASSISTENTE
-# ─────────────────────────────────────────────
-
-SYSTEM_PROMPT = """Você é a secretária pessoal e inteligente do Victor Silva, especialista em CRM de iGaming.
-
-Você tem acesso completo ao contexto dele:
-- Raio-X: quem ele é, o que faz em cada empresa, prioridades
-- Tasks pendentes reais do banco de dados
-- Histórico da conversa atual
-
-CONTEXTO ATUAL:
-{context}
-
-─────────────────────────────────────────────
-COMO VOCÊ FUNCIONA:
-
-1. Você lê o histórico + a nova mensagem e ENTENDE o que Victor quer
-2. Você responde de forma natural, como uma secretária próxima e inteligente
-3. Se precisar executar uma ação (salvar, concluir, cancelar, atualizar), inclua no JSON
-
-SEMPRE retorne um JSON válido (sem markdown, sem texto extra):
-{{
-  "resposta": "sua resposta em texto natural, sem markdown, sem asteriscos",
-  "acao": null,
-  "dados": {{}}
-}}
-
-Valores possíveis para "acao":
-
-→ "salvar_item": quando Victor registrar algo novo
-  "dados": {{
-    "tipo": "task|idea|insight|question|priority|meeting|financial|health|personal",
-    "texto": "texto limpo do item",
-    "empresa": "betvip|ng|pwp|pessoal|todos",
-    "categoria": "crm|growth|produto|lideranca|saude|financeiro|pessoal|projeto",
-    "prioridade": 1,
-    "tags": ["tag"],
-    "prazo": "YYYY-MM-DD ou null"
-  }}
-
-→ "concluir_busca": marcar item específico como concluído por texto
-  "dados": {{"busca": "palavras-chave do item"}}
-
-→ "cancelar_busca": cancelar item específico por texto
-  "dados": {{"busca": "palavras-chave do item"}}
-
-→ "bulk_concluir": concluir todos de uma empresa ou categoria
-  "dados": {{"filtro_empresa": "pwp|ng|betvip|pessoal|null", "filtro_categoria": "crm|saude|...|null"}}
-
-→ "bulk_cancelar": cancelar todos de uma empresa ou categoria
-  "dados": {{"filtro_empresa": "pwp|ng|betvip|pessoal|null", "filtro_categoria": "crm|saude|...|null"}}
-
-→ "atualizar_raiox": atualizar chave do Raio-X
-  "dados": {{"chave": "nome_da_chave", "valor": "novo valor completo"}}
-
-─────────────────────────────────────────────
-REGRAS DE COMPORTAMENTO:
-
-- Use o HISTÓRICO para entender respostas curtas ("1", "sim", "todas", "isso")
-- Use as TASKS REAIS do banco para responder perguntas sobre o que está pendente
-- Se perguntarem sobre uma empresa/projeto que não existe no contexto, diga que não está cadastrado e pergunte se quer adicionar
-- Quando Victor disser que concluiu algo, execute a ação E confirme
-- Quando Victor perguntar sobre prioridades, use os dados reais de tasks_pendentes
-- Tom: direto, próximo, sem enrolação. Máximo 4 linhas na resposta quando possível
-- Sem markdown na resposta (sem **, sem #, sem -)
-- Emojis com moderação, só quando fizer sentido"""
-
-
-# ─────────────────────────────────────────────
-# CHAMADA AO CLAUDE (com histórico)
-# ─────────────────────────────────────────────
-
-async def think(user_text: str, chat_id: int) -> dict:
-    context  = get_full_context()
-    history  = get_history(chat_id)
-    messages = history + [{"role": "user", "content": user_text}]
-
-    response = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1000,
-        system=SYSTEM_PROMPT.format(context=context),
-        messages=messages
-    )
-
-    raw = response.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw.strip())
-
-
-# ─────────────────────────────────────────────
-# EXECUÇÃO DE AÇÕES
-# ─────────────────────────────────────────────
-
-def do_salvar_item(dados: dict, original: str, msg_id: int):
-    row = {
-        "tipo":         dados.get("tipo", "idea"),
-        "texto":        dados.get("texto", original),
-        "empresa":      dados.get("empresa", "pessoal"),
-        "categoria":    dados.get("categoria", "pessoal"),
-        "prioridade":   dados.get("prioridade", 3),
-        "status":       "pendente",
-        "tags":         dados.get("tags", []),
-        "prazo":        dados.get("prazo"),
-        "fonte":        "telegram",
-        "msg_original": original,
-    }
-    supabase.table('items').insert(row).execute()
-    supabase.table('log_mensagens').insert({
-        "telegram_msg_id":     msg_id,
-        "conteudo_raw":        original,
-        "conteudo_processado": json.dumps(dados, ensure_ascii=False),
-        "items_gerados":       1,
-    }).execute()
-
-
-def do_busca_update(busca: str, novo_status: str) -> int:
-    words = [w for w in busca.lower().split() if len(w) > 3]
-    if not words:
-        return 0
-    rows = (supabase.table('items')
-            .select('id, texto')
-            .eq('status', 'pendente')
-            .order('criado_em', desc=True)
-            .limit(100)
-            .execute().data)
-
-    matches = []
-    for row in rows:
-        txt = (row.get('texto') or '').lower()
-        score = sum(1 for w in words if w in txt)
-        if score >= max(1, len(words) // 2):
-            matches.append((score, row['id']))
-
-    matches.sort(key=lambda x: -x[0])
-    count = 0
-    patch = {"status": novo_status}
-    if novo_status == "concluido":
-        patch["concluido_em"] = datetime.utcnow().isoformat()
-
-    for _, item_id in matches[:5]:
-        supabase.table('items').update(patch).eq('id', item_id).execute()
-        count += 1
-    return count
-
-
-def do_bulk_update(novo_status: str, filtro_empresa: str | None, filtro_categoria: str | None) -> int:
-    patch = {"status": novo_status}
-    if novo_status == "concluido":
-        patch["concluido_em"] = datetime.utcnow().isoformat()
-
-    query = supabase.table('items').update(patch).eq('status', 'pendente')
-    if filtro_empresa and filtro_empresa != "null":
-        query = query.eq('empresa', filtro_empresa)
-    if filtro_categoria and filtro_categoria != "null":
-        query = query.eq('categoria', filtro_categoria)
-
-    res = query.execute()
-    return len(res.data) if res.data else 0
-
-
-def do_atualizar_raiox(chave: str, valor: str) -> bool:
-    try:
-        supabase.table('raio_x').upsert(
-            {"chave": chave, "valor": valor},
-            on_conflict="chave"
-        ).execute()
-        return True
+        rows = supabase.table('raio_x').select('chave, valor').execute().data
+        return "\n".join(f"[{r['chave']}]: {r['valor']}" for r in rows)
     except Exception as e:
         logger.error(f"Erro raio-x: {e}")
-        return False
+        return "(erro ao carregar raio-x)"
 
 
 # ─────────────────────────────────────────────
-# HANDLER PRINCIPAL
+# TOOLS — 4 ferramentas genéricas
+# ─────────────────────────────────────────────
+
+TOOLS = [
+    {
+        "name": "consultar",
+        "description": """Consulta dados do banco de dados do Victor. Use SEMPRE que precisar de informações reais — nunca invente.
+
+Tabelas disponíveis:
+- items: tarefas, ideias, insights, prioridades
+  Campos: id, tipo, texto, categoria, empresa, prioridade (1-5), status (pendente/concluido/cancelado), tags, pessoas, prazo, criado_em, atualizado_em, concluido_em, fonte, msg_original
+- raio_x: contexto pessoal/profissional (chave, valor, atualizado_em)
+- categorias: categorias do sistema (slug, nome, cor, icone)
+- log_mensagens: histórico de processamento (telegram_msg_id, conteudo_raw, items_gerados, criado_em)
+
+Dicas:
+- Use contar=true para saber quantos registros existem
+- Use busca_texto para buscar por palavras no texto dos items
+- Use or_filtro para condições OR no formato Supabase: 'campo1.eq.valor1,campo2.eq.valor2'
+- Combine múltiplos filtros para queries complexas""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tabela": {
+                    "type": "string",
+                    "enum": ["items", "raio_x", "categorias", "log_mensagens"],
+                    "description": "Tabela a consultar"
+                },
+                "select": {
+                    "type": "string",
+                    "description": "Campos a retornar separados por vírgula. Default: '*'"
+                },
+                "filtros": {
+                    "type": "array",
+                    "description": "Filtros AND. Cada filtro: {campo, operador, valor}",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "campo": {"type": "string"},
+                            "operador": {
+                                "type": "string",
+                                "enum": ["eq", "neq", "gt", "gte", "lt", "lte", "like", "ilike", "in", "is"]
+                            },
+                            "valor": {"description": "Valor para comparação (tipo varia)"}
+                        },
+                        "required": ["campo", "operador", "valor"]
+                    }
+                },
+                "or_filtro": {
+                    "type": "string",
+                    "description": "Filtro OR no formato Supabase. Ex: 'prazo.eq.2024-01-01,prioridade.eq.1'"
+                },
+                "busca_texto": {
+                    "type": "string",
+                    "description": "Busca por texto (ILIKE %termo%). Funciona na tabela items."
+                },
+                "ordem": {
+                    "type": "string",
+                    "description": "Campo para ordenar. Prefixe '-' para DESC. Ex: '-criado_em', 'prioridade'"
+                },
+                "limite": {
+                    "type": "integer",
+                    "description": "Máximo de registros retornados (default 50)"
+                },
+                "contar": {
+                    "type": "boolean",
+                    "description": "Se true, retorna apenas a contagem total sem dados"
+                }
+            },
+            "required": ["tabela"]
+        }
+    },
+    {
+        "name": "modificar",
+        "description": """Atualiza registros existentes no banco. Use para:
+- Marcar tasks como concluídas (status='concluido', concluido_em=datetime atual)
+- Cancelar tasks (status='cancelado')
+- Mudar prioridade, empresa, categoria, texto, prazo
+- Atualizar chaves do raio-x
+- Editar categorias
+
+IMPORTANTE: Para concluir items, sempre inclua concluido_em com a data/hora atual nos dados.
+Filtros são obrigatórios para segurança (não permite update sem WHERE).""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tabela": {
+                    "type": "string",
+                    "enum": ["items", "raio_x", "categorias"],
+                    "description": "Tabela a modificar"
+                },
+                "filtros": {
+                    "type": "array",
+                    "description": "Condições para selecionar registros a atualizar",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "campo": {"type": "string"},
+                            "operador": {
+                                "type": "string",
+                                "enum": ["eq", "neq", "gt", "gte", "lt", "lte", "like", "ilike", "in"]
+                            },
+                            "valor": {}
+                        },
+                        "required": ["campo", "operador", "valor"]
+                    }
+                },
+                "dados": {
+                    "type": "object",
+                    "description": "Campos e valores a atualizar. Ex: {'status': 'concluido', 'concluido_em': '2024-01-01T12:00:00'}"
+                }
+            },
+            "required": ["tabela", "filtros", "dados"]
+        }
+    },
+    {
+        "name": "inserir",
+        "description": """Insere novo registro no banco. Use para:
+- Salvar novas tarefas, ideias, insights, perguntas, reuniões
+- Atualizar/criar chaves no raio-x (faz upsert automático na chave)
+- Criar novas categorias
+
+Para items — classifique automaticamente com base no contexto do Victor:
+  tipo: task|idea|insight|question|priority|meeting|financial|health|personal
+  empresa: betvip|ng|pwp|pessoal|todos
+  categoria: crm|growth|produto|lideranca|saude|financeiro|pessoal|projeto
+  prioridade: 1 (crítico) a 5 (baixa)
+  status: default 'pendente'
+  tags: array de strings
+  prazo: 'YYYY-MM-DD' ou null""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tabela": {
+                    "type": "string",
+                    "enum": ["items", "raio_x", "categorias"],
+                    "description": "Tabela onde inserir"
+                },
+                "dados": {
+                    "type": "object",
+                    "description": "Dados do novo registro"
+                }
+            },
+            "required": ["tabela", "dados"]
+        }
+    },
+    {
+        "name": "deletar",
+        "description": """Remove registros permanentemente do banco. Use com CUIDADO.
+Prefira cancelar items (status='cancelado') em vez de deletar.
+Delete apenas quando Victor pedir explicitamente para remover algo.
+Filtros são obrigatórios (proteção contra delete sem WHERE).""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tabela": {
+                    "type": "string",
+                    "enum": ["items", "raio_x", "categorias"],
+                    "description": "Tabela de onde deletar"
+                },
+                "filtros": {
+                    "type": "array",
+                    "description": "Condições para selecionar registros a deletar",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "campo": {"type": "string"},
+                            "operador": {
+                                "type": "string",
+                                "enum": ["eq", "neq", "like", "ilike"]
+                            },
+                            "valor": {}
+                        },
+                        "required": ["campo", "operador", "valor"]
+                    }
+                }
+            },
+            "required": ["tabela", "filtros"]
+        }
+    }
+]
+
+
+# ─────────────────────────────────────────────
+# EXECUÇÃO DE TOOLS
+# ─────────────────────────────────────────────
+
+def apply_filters(query, filtros):
+    if not filtros:
+        return query
+    for f in filtros:
+        campo = f['campo']
+        op    = f['operador']
+        valor = f['valor']
+        if   op == 'eq':    query = query.eq(campo, valor)
+        elif op == 'neq':   query = query.neq(campo, valor)
+        elif op == 'gt':    query = query.gt(campo, valor)
+        elif op == 'gte':   query = query.gte(campo, valor)
+        elif op == 'lt':    query = query.lt(campo, valor)
+        elif op == 'lte':   query = query.lte(campo, valor)
+        elif op == 'like':  query = query.like(campo, valor)
+        elif op == 'ilike': query = query.ilike(campo, valor)
+        elif op == 'in':    query = query.in_(campo, valor)
+        elif op == 'is':    query = query.is_(campo, valor)
+    return query
+
+
+def exec_consultar(params: dict) -> dict:
+    tabela  = params['tabela']
+    select  = params.get('select', '*')
+    filtros = params.get('filtros', [])
+    or_filt = params.get('or_filtro', '')
+    busca   = params.get('busca_texto', '')
+    ordem   = params.get('ordem', '')
+    limite  = params.get('limite', 50)
+    contar  = params.get('contar', False)
+
+    try:
+        if contar:
+            query = supabase.table(tabela).select('id', count='exact')
+        else:
+            query = supabase.table(tabela).select(select)
+
+        query = apply_filters(query, filtros)
+
+        if or_filt:
+            query = query.or_(or_filt)
+
+        if busca and tabela == 'items':
+            query = query.ilike('texto', f'%{busca}%')
+
+        if ordem:
+            if ordem.startswith('-'):
+                query = query.order(ordem[1:], desc=True)
+            else:
+                query = query.order(ordem)
+
+        if contar:
+            result = query.limit(1).execute()
+            return {"contagem": result.count if result.count is not None else 0, "status": "ok"}
+        else:
+            result = query.limit(min(limite, 100)).execute()
+            dados = result.data or []
+            # Truncar se muito grande para não estourar contexto
+            if len(json.dumps(dados, ensure_ascii=False, default=str)) > 6000:
+                dados = dados[:20]
+                return {"dados": dados, "total_retornado": len(dados), "truncado": True, "status": "ok"}
+            return {"dados": dados, "total_retornado": len(dados), "status": "ok"}
+
+    except Exception as e:
+        logger.error(f"Erro consultar: {e}")
+        return {"erro": str(e), "status": "erro"}
+
+
+def exec_modificar(params: dict) -> dict:
+    tabela  = params['tabela']
+    filtros = params.get('filtros', [])
+    dados   = params.get('dados', {})
+
+    if not filtros:
+        return {"erro": "Filtros obrigatórios para segurança", "status": "erro"}
+
+    try:
+        query = supabase.table(tabela).update(dados)
+        query = apply_filters(query, filtros)
+        result = query.execute()
+        count = len(result.data) if result.data else 0
+        return {"modificados": count, "status": "ok"}
+    except Exception as e:
+        logger.error(f"Erro modificar: {e}")
+        return {"erro": str(e), "status": "erro"}
+
+
+def exec_inserir(params: dict) -> dict:
+    tabela = params['tabela']
+    dados  = params.get('dados', {})
+
+    try:
+        if tabela == 'raio_x':
+            result = supabase.table(tabela).upsert(dados, on_conflict='chave').execute()
+        else:
+            # Defaults para items
+            if tabela == 'items':
+                dados.setdefault('status', 'pendente')
+                dados.setdefault('fonte', 'telegram')
+            result = supabase.table(tabela).insert(dados).execute()
+
+        inserted = result.data[0] if result.data else {}
+        return {"inserido": inserted, "status": "ok"}
+    except Exception as e:
+        logger.error(f"Erro inserir: {e}")
+        return {"erro": str(e), "status": "erro"}
+
+
+def exec_deletar(params: dict) -> dict:
+    tabela  = params['tabela']
+    filtros = params.get('filtros', [])
+
+    if not filtros:
+        return {"erro": "Filtros obrigatórios para segurança", "status": "erro"}
+
+    try:
+        query = supabase.table(tabela).delete()
+        query = apply_filters(query, filtros)
+        result = query.execute()
+        count = len(result.data) if result.data else 0
+        return {"deletados": count, "status": "ok"}
+    except Exception as e:
+        logger.error(f"Erro deletar: {e}")
+        return {"erro": str(e), "status": "erro"}
+
+
+def execute_tool(name: str, params: dict) -> dict:
+    logger.info(f"🔧 Tool: {name} | {json.dumps(params, ensure_ascii=False, default=str)[:300]}")
+
+    executors = {
+        "consultar": exec_consultar,
+        "modificar": exec_modificar,
+        "inserir":   exec_inserir,
+        "deletar":   exec_deletar,
+    }
+
+    executor = executors.get(name)
+    if not executor:
+        return {"erro": f"Tool desconhecida: {name}", "status": "erro"}
+
+    result = executor(params)
+    logger.info(f"📦 Resultado: {json.dumps(result, ensure_ascii=False, default=str)[:300]}")
+    return result
+
+
+# ─────────────────────────────────────────────
+# SYSTEM PROMPT
+# ─────────────────────────────────────────────
+
+SYSTEM_PROMPT = """Você é o assistente pessoal do Victor Silva. Uma secretária inteligente, obcecada por organização, que conhece tudo sobre ele.
+
+Você TEM ACESSO REAL ao banco de dados via tools. Use-as para qualquer operação com dados — NUNCA invente números ou informações.
+
+RAIO-X DO VICTOR:
+{raio_x}
+
+DATA DE HOJE: {hoje}
+
+─────────────────────────────────────────────
+COMO FUNCIONA:
+
+1. Victor manda mensagem (task, pergunta, desabafo, ideia, comando, qualquer coisa)
+2. Você ENTENDE o que ele quer usando contexto + histórico
+3. Se precisa de dados → usa tool consultar ANTES de responder
+4. Se precisa executar algo → usa a tool adequada
+5. Responde naturalmente, como pessoa de confiança
+
+─────────────────────────────────────────────
+INTELIGÊNCIA ESPERADA:
+
+- "fiz aquilo do Ícaro" → busca task sobre Ícaro e marca como concluída
+- "anota: ligar pro João amanhã" → cria item tipo task, prazo amanhã
+- "como tá meu panorama?" → consulta pendentes por empresa, dá resumo
+- "esse projeto morreu" → cancela items relacionados
+- "quantas tasks tenho?" → usa consultar com contar=true
+- "sim", "1", "esse" → usa HISTÓRICO para entender referência
+- Desabafo/reflexão → responde com empatia, pergunta se quer registrar
+
+─────────────────────────────────────────────
+REGRAS:
+
+- Tom: direto, próximo, inteligente. Pessoa de confiança, não robô
+- Máximo 4-5 linhas quando possível
+- Sem markdown (sem **, sem #, sem -)
+- Emojis com moderação
+- NUNCA diga "não consigo" — se tem tool disponível, use
+- Classifique tipo/empresa/categoria/prioridade automaticamente
+- Se não souber a empresa, pergunte
+- Pessoa nova mencionada → sugira adicionar ao raio-x"""
+
+
+# ─────────────────────────────────────────────
+# LOOP PRINCIPAL — Claude com tool_use
+# ─────────────────────────────────────────────
+
+async def think(user_text: str, chat_id: int) -> str:
+    raio_x  = get_raio_x()
+    history = get_history(chat_id)
+
+    messages = history + [{"role": "user", "content": user_text}]
+
+    system = SYSTEM_PROMPT.format(
+        raio_x=raio_x,
+        hoje=date.today().isoformat()
+    )
+
+    max_rounds = 6  # segurança contra loops infinitos
+
+    for round_num in range(max_rounds):
+        try:
+            response = claude.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=1500,
+                system=system,
+                messages=messages,
+                tools=TOOLS
+            )
+        except Exception as e:
+            logger.error(f"Erro Claude API: {e}")
+            return "Tive um problema ao processar. Tenta de novo?"
+
+        # Separar blocos de texto e tool_use
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        text_parts  = [b.text for b in response.content if b.type == "text"]
+
+        if not tool_blocks:
+            # Sem tools → resposta final
+            return " ".join(text_parts).strip() or "..."
+
+        # Tem tool calls → executar e continuar
+        # Serializar resposta do assistant para o histórico
+        assistant_content = []
+        for block in response.content:
+            if block.type == "text":
+                assistant_content.append({"type": "text", "text": block.text})
+            elif block.type == "tool_use":
+                assistant_content.append({
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input
+                })
+
+        messages.append({"role": "assistant", "content": assistant_content})
+
+        # Executar cada tool e coletar resultados
+        tool_results = []
+        for block in tool_blocks:
+            result = execute_tool(block.name, block.input)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": json.dumps(result, ensure_ascii=False, default=str)
+            })
+
+        messages.append({"role": "user", "content": tool_results})
+
+        logger.info(f"Round {round_num + 1}: {len(tool_blocks)} tool(s) executada(s), stop_reason={response.stop_reason}")
+
+    return "Processamento ficou complexo. Tenta reformular de forma mais direta?"
+
+
+# ─────────────────────────────────────────────
+# HANDLERS DO TELEGRAM
 # ─────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -255,73 +518,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text    = update.message.text
-    msg_id  = update.message.message_id
     chat_id = update.effective_chat.id
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        result   = await think(text, chat_id)
-        resposta = result.get("resposta", "...")
-        acao     = result.get("acao")
-        dados    = result.get("dados", {})
+        resposta = await think(text, chat_id)
 
-        # executa ação se houver
-        extra = ""
-        if acao == "salvar_item":
-            do_salvar_item(dados, text, msg_id)
-            extra = " ✅"
-
-        elif acao == "concluir_busca":
-            count = do_busca_update(dados.get("busca", text), "concluido")
-            extra = f" ({count} item{'s' if count != 1 else ''} concluído{'s' if count != 1 else ''})"
-
-        elif acao == "cancelar_busca":
-            count = do_busca_update(dados.get("busca", text), "cancelado")
-            extra = f" ({count} item{'s' if count != 1 else ''} cancelado{'s' if count != 1 else ''})"
-
-        elif acao == "bulk_concluir":
-            count = do_bulk_update("concluido", dados.get("filtro_empresa"), dados.get("filtro_categoria"))
-            extra = f" ({count} itens concluídos)"
-
-        elif acao == "bulk_cancelar":
-            count = do_bulk_update("cancelado", dados.get("filtro_empresa"), dados.get("filtro_categoria"))
-            extra = f" ({count} itens cancelados)"
-
-        elif acao == "atualizar_raiox":
-            do_atualizar_raiox(dados.get("chave", ""), dados.get("valor", ""))
-
-        # adiciona ao histórico
         add_to_history(chat_id, "user",      text)
-        add_to_history(chat_id, "assistant", resposta + extra)
+        add_to_history(chat_id, "assistant", resposta)
 
-        await update.message.reply_text(resposta + extra)
+        # Telegram tem limite de 4096 chars por mensagem
+        if len(resposta) <= 4096:
+            await update.message.reply_text(resposta)
+        else:
+            for i in range(0, len(resposta), 4096):
+                await update.message.reply_text(resposta[i:i + 4096])
 
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON inválido: {e}")
-        await update.message.reply_text("Tive um problema interno. Tenta de novo?")
     except Exception as e:
         logger.error(f"Erro: {e}", exc_info=True)
-        await update.message.reply_text("Algo deu errado. Já olho isso.")
+        await update.message.reply_text("Algo deu errado. Tenta de novo?")
 
-
-# ─────────────────────────────────────────────
-# COMMANDS
-# ─────────────────────────────────────────────
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        f"🧠 Victor Brain online.\n\n"
-        f"Fala comigo como fala com uma pessoa. Registro tasks, ideias, insights, "
-        f"marco coisas como feitas, busco o que está pendente — tudo por conversa natural.\n\n"
+        f"🧠 Victor Brain v2 online.\n\n"
+        f"Fala comigo naturalmente. Eu consulto o banco, salvo coisas, "
+        f"marco como feito, dou panoramas — tudo por conversa.\n\n"
         f"Comandos rápidos:\n"
-        f"/pendentes — prioridades P1 e P2\n"
-        f"/hoje — o que vence hoje\n"
-        f"/limpar — limpa histórico da conversa\n\n"
-        f"Seu chat ID: {chat_id}"
+        f"/pendentes — P1 e P2\n"
+        f"/hoje — vencimentos de hoje\n"
+        f"/panorama — visão geral\n"
+        f"/limpar — limpa histórico\n\n"
+        f"Chat ID: {chat_id}"
     )
 
 
@@ -341,11 +573,11 @@ async def handle_pendentes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Nada crítico ou urgente no momento. ✅")
             return
 
-        EMPRESA = {"betvip":"BetVIP","ng":"NG","pwp":"PWP","pessoal":"Pessoal","todos":"Geral"}
+        EMP = {"betvip": "BetVIP", "ng": "NG", "pwp": "PWP", "pessoal": "Pessoal", "todos": "Geral"}
         lines = ["Prioridades P1 e P2:\n"]
         for r in rows:
-            emp = EMPRESA.get(r.get('empresa','pessoal'), '?')
-            txt = r.get('texto','')[:70]
+            emp = EMP.get(r.get('empresa', 'pessoal'), '?')
+            txt = r.get('texto', '')[:70]
             p   = r.get('prioridade', 2)
             lines.append(f"P{p} [{emp}] {txt}")
 
@@ -369,14 +601,14 @@ async def handle_hoje(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 .execute().data)
 
         if not rows:
-            await update.message.reply_text("Nada com vencimento hoje.")
+            await update.message.reply_text("Nada urgente para hoje. ✅")
             return
 
-        EMPRESA = {"betvip":"BetVIP","ng":"NG","pwp":"PWP","pessoal":"Pessoal","todos":"Geral"}
+        EMP = {"betvip": "BetVIP", "ng": "NG", "pwp": "PWP", "pessoal": "Pessoal", "todos": "Geral"}
         lines = [f"Para hoje ({hoje}):\n"]
         for r in rows:
-            emp = EMPRESA.get(r.get('empresa','pessoal'),'?')
-            txt = r.get('texto','')[:70]
+            emp = EMP.get(r.get('empresa', 'pessoal'), '?')
+            txt = r.get('texto', '')[:70]
             lines.append(f"[{emp}] {txt}")
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
@@ -384,12 +616,33 @@ async def handle_hoje(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Erro ao buscar. Tenta de novo.")
 
 
+async def handle_panorama(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pede ao Claude um panorama completo usando as tools"""
+    if not is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    try:
+        resposta = await think(
+            "Me dá o panorama geral agora: quantas tarefas pendentes total e por empresa, "
+            "quais são P1 e P2, se tem algo vencendo hoje ou atrasado, e um resumo rápido do estado geral.",
+            chat_id
+        )
+        add_to_history(chat_id, "user",      "/panorama")
+        add_to_history(chat_id, "assistant", resposta)
+        await update.message.reply_text(resposta)
+    except Exception as e:
+        logger.error(f"Erro /panorama: {e}")
+        await update.message.reply_text("Erro ao gerar panorama.")
+
+
 async def handle_limpar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     chat_id = update.effective_chat.id
     conversation_history.pop(chat_id, None)
-    await update.message.reply_text("Histórico da conversa limpo. Novo começo! 🧹")
+    await update.message.reply_text("Histórico limpo. Novo começo! 🧹")
 
 
 # ─────────────────────────────────────────────
@@ -401,9 +654,10 @@ def main():
     app.add_handler(CommandHandler("start",     handle_start))
     app.add_handler(CommandHandler("pendentes", handle_pendentes))
     app.add_handler(CommandHandler("hoje",      handle_hoje))
+    app.add_handler(CommandHandler("panorama",  handle_panorama))
     app.add_handler(CommandHandler("limpar",    handle_limpar))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("🧠 Victor Brain — modo assistente iniciado.")
+    logger.info(f"🧠 Victor Brain v2 — modelo: {CLAUDE_MODEL}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
